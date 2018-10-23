@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"flag"
 	"fmt"
 	"go/ast"
 	"go/format"
@@ -11,6 +12,7 @@ import (
 	l "log"
 	"os"
 	"path"
+	"path/filepath"
 	"strings"
 	"text/template"
 
@@ -57,9 +59,67 @@ type Package struct {
 }
 
 func main() {
-	subpkgs, err := getSubpackages("google.golang.org/api/people/v1")
+	out := flag.String("output", "", "Output dir")
+	in := flag.String("input", "", "Package to make testable")
+	flag.Parse()
+
+	if in == nil || *in == "" {
+		fmt.Fprintln(os.Stderr, "Require a package name")
+		os.Exit(1)
+	}
+
+	absOut, err := filepath.Abs(*out)
 	if err != nil {
-		log.Fatal(err.Error())
+		fmt.Fprintf(os.Stderr, err.Error())
+		os.Exit(1)
+	}
+	out = &absOut
+
+	basePkg := strings.TrimPrefix(*out, path.Join(os.Getenv("GOPATH"), "src")+"/")
+
+	ifacePkgs, implPkgs, err := genCode(*in, basePkg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, err.Error())
+		os.Exit(1)
+	}
+
+	for pkgName, pkg := range ifacePkgs {
+		pkgPath := path.Join(*out, pkgName)
+		err := os.MkdirAll(pkgPath, os.ModePerm)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, err.Error())
+			os.Exit(1)
+		}
+
+		pkgFile := path.Join(pkgPath, pkgName+".go")
+		err = ioutil.WriteFile(pkgFile, []byte(pkg), os.ModePerm)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, err.Error())
+			os.Exit(1)
+		}
+	}
+
+	for pkgName, pkg := range implPkgs {
+		pkgPath := path.Join(*out, pkgName)
+		err := os.MkdirAll(pkgPath, os.ModePerm)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, err.Error())
+			os.Exit(1)
+		}
+
+		pkgFile := path.Join(pkgPath, pkgName+".go")
+		err = ioutil.WriteFile(pkgFile, []byte(pkg), os.ModePerm)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, err.Error())
+			os.Exit(1)
+		}
+	}
+}
+
+func genCode(pkgPath string, basePkg string) (map[string]string, map[string]string, error) {
+	subpkgs, err := getSubpackages(pkgPath)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	ifaceTmpl := `
@@ -76,23 +136,25 @@ package {{.Name}}iface
 package {{.Name}}
 
 import "{{ .ImportPath }}"
+import "{{ .BasePkg }}/{{.Name}}iface"
 
 {{ range $impl := .Implementations }}
 {{ $impl }}
 {{ end }}
 `
-
+	ifacePkgsMap := make(map[string]string)
+	implPkgsMap := make(map[string]string)
 	for subpkgName, subpkg := range subpkgs {
 		ifaces, err := buildIfaces(subpkg)
 		if err != nil {
-			log.Fatal(err.Error())
+			return nil, nil, err
 		}
 
 		ifacePkgBuf := new(bytes.Buffer)
 
 		tmpl, err := template.New("iface").Parse(ifaceTmpl)
 		if err != nil {
-			log.Fatal(err.Error())
+			return nil, nil, err
 		}
 
 		err = tmpl.Execute(ifacePkgBuf, struct {
@@ -105,38 +167,42 @@ import "{{ .ImportPath }}"
 
 		ifacePkg, err := format.Source(ifacePkgBuf.Bytes())
 		if err != nil {
-			log.Fatal(err.Error())
+			return nil, nil, err
 		}
 
 		impls, err := buildImpls(subpkg)
 		if err != nil {
-			log.Fatal(err.Error())
+			return nil, nil, err
 		}
 
 		implPkgBuf := new(bytes.Buffer)
 		tmpl, err = template.New("impl").Parse(implTmpl)
 		if err != nil {
-			log.Fatal(err.Error())
+			return nil, nil, err
 		}
 
 		err = tmpl.Execute(implPkgBuf, struct {
 			Name            string
 			Implementations []string
 			ImportPath      string
+			BasePkg         string
 		}{
 			Name:            subpkgName,
 			Implementations: impls,
 			ImportPath:      subpkg.ImportPath,
+			BasePkg:         basePkg,
 		})
 
 		implPkg, err := format.Source(implPkgBuf.Bytes())
 		if err != nil {
-			log.Fatal(err.Error())
+			return nil, nil, err
 		}
 
-		fmt.Println(string(ifacePkg))
-		fmt.Println(string(implPkg))
+		ifacePkgsMap[subpkgName+"iface"] = string(ifacePkg)
+		implPkgsMap[subpkgName] = string(implPkg)
 	}
+
+	return ifacePkgsMap, implPkgsMap, nil
 }
 
 func parsePkg(pkg string) (map[string]*ast.Package, error) {
