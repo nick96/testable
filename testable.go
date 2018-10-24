@@ -46,7 +46,7 @@ type Struct struct {
 type Function struct {
 	Name       string
 	ImportPath string
-	Parameters []*Field
+	Params     []*Field
 	Results    []*Field
 }
 
@@ -142,6 +142,10 @@ import "{{ .BasePkg }}/{{.Name}}iface"
 {{ range $impl := .Implementations }}
 {{ $impl }}
 {{ end }}
+
+{{ range $func := .Funcs }}
+{{ $func }}
+{{ end }}
 `
 	ifacePkgsMap := make(map[string]string)
 	implPkgsMap := make(map[string]string)
@@ -176,6 +180,11 @@ import "{{ .BasePkg }}/{{.Name}}iface"
 			return nil, nil, err
 		}
 
+		funcs, err := buildFuncs(subpkg)
+		if err != nil {
+			return nil, nil, err
+		}
+
 		implPkgBuf := new(bytes.Buffer)
 		tmpl, err = template.New("impl").Parse(implTmpl)
 		if err != nil {
@@ -185,14 +194,19 @@ import "{{ .BasePkg }}/{{.Name}}iface"
 		err = tmpl.Execute(implPkgBuf, struct {
 			Name            string
 			Implementations []string
+			Funcs           []string
 			ImportPath      string
 			BasePkg         string
 		}{
 			Name:            subpkgName,
 			Implementations: impls,
+			Funcs:           funcs,
 			ImportPath:      subpkg.ImportPath,
 			BasePkg:         basePkg,
 		})
+		if err != nil {
+			return nil, nil, err
+		}
 
 		implPkg, err := format.Source(implPkgBuf.Bytes())
 		if err != nil {
@@ -210,8 +224,71 @@ func parsePkg(pkg string) (map[string]*ast.Package, error) {
 	pkg = path.Join(os.Getenv("GOPATH"), "src", pkg)
 	return parser.ParseDir(token.NewFileSet(), pkg, func(info os.FileInfo) bool {
 		return !strings.Contains(info.Name(), "test")
-	}, parser.ParseComments)
+	}, parser.DeclarationErrors)
 
+}
+
+func buildFuncs(pkg *Package) ([]string, error) {
+	fn := `
+func {{ .Name }}({{ toList .Params }}) ({{ toList .Results }}) {
+    return {{ .PkgName }}.{{ .Name }}({{ toArgs .Params }})
+}
+`
+	fnTmpl, err := template.New("fn").Funcs(template.FuncMap{
+		"toList": func(fields []*Field) string {
+			var list string
+			prefix := ""
+			for _, field := range fields {
+				typ := maybeAddIfacePkg(pkg, field.Type)
+				list += prefix + field.Name + " " + typ
+				prefix = ", "
+			}
+			return list
+		},
+		"returnsError": func(fields []*Field) bool {
+			for _, field := range fields {
+				if field.Type == "error" {
+					return true
+				}
+			}
+			return false
+		},
+		"toArgs": func(fields []*Field) string {
+			var args string
+			prefix := ""
+			for _, field := range fields {
+				args += prefix + field.Name
+				prefix = ", "
+			}
+			return args
+		},
+	}).Parse(fn)
+	if err != nil {
+		return []string{}, err
+	}
+
+	var funcs []string
+	for _, fn := range pkg.Functions {
+		buf := new(bytes.Buffer)
+		err := fnTmpl.Execute(buf, struct {
+			PkgName string
+			Name    string
+			Params  []*Field
+			Results []*Field
+		}{
+			PkgName: pkg.Name,
+			Name:    fn.Name,
+			Params:  fn.Params,
+			Results: fn.Results,
+		})
+		if err != nil {
+			return []string{}, err
+		}
+
+		funcs = append(funcs, buf.String())
+	}
+
+	return funcs, nil
 }
 
 func getSubpackages(pkg string) (map[string]*Package, error) {
@@ -242,7 +319,36 @@ func getSubpackages(pkg string) (map[string]*Package, error) {
 }
 
 func getFunctions(pkg *ast.Package) ([]*Function, error) {
-	return []*Function{}, nil
+	var funcs []*Function
+
+	for astFileName, astFile := range pkg.Files {
+		src, err := ioutil.ReadFile(astFileName)
+		if err != nil {
+			continue
+		}
+		for _, decl := range astFile.Decls {
+			if _, fd := maker.GetReceiverTypeName(src, decl); fd == nil {
+				if fd, ok := decl.(*ast.FuncDecl); ok {
+					if fd.Name != nil {
+
+						params := getMethodFields(src, fd.Type.Params.List)
+						results := []*Field{}
+						if fd.Type.Results != nil {
+							results = getMethodFields(src,
+								fd.Type.Results.List)
+						}
+						funcs = append(funcs, &Function{
+							Name:    fd.Name.Name,
+							Params:  params,
+							Results: results,
+						})
+					}
+				}
+			}
+		}
+	}
+
+	return funcs, nil
 }
 
 func getStructs(pkg *ast.Package) ([]*Struct, error) {
@@ -275,6 +381,7 @@ func getStructs(pkg *ast.Package) ([]*Struct, error) {
 		} else {
 			st.Fields = stfields
 		}
+		structMap[stName] = st
 	}
 
 	structs := make([]*Struct, 0)
