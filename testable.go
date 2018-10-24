@@ -65,6 +65,7 @@ func main() {
 
 	if in == nil || *in == "" {
 		fmt.Fprintln(os.Stderr, "Require a package name")
+		flag.PrintDefaults()
 		os.Exit(1)
 	}
 
